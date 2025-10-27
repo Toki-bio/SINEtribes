@@ -1,0 +1,338 @@
+#!/bin/bash
+
+# tribes.sh - Cluster SINE sequences into tribes and generate consensuses
+# Usage: tribes.sh input.fasta
+
+if [ $# -ne 1 ]; then
+    echo "Usage: $0 <input.fasta>"
+    exit 1
+fi
+
+INPUT="$1"
+
+# Dependency check
+for cmd in vsearch mafft cons seqkit; do
+    if ! command -v "$cmd" &> /dev/null; then
+        echo "Error: Missing required dependency: $cmd"
+        echo "Install via: conda install -c bioconda vsearch mafft emboss seqkit"
+        exit 1
+    fi
+done
+
+# Validate input
+if [ ! -f "$INPUT" ] || [ ! -s "$INPUT" ]; then
+    echo "Error: Input file '$INPUT' not found or empty."
+    exit 1
+fi
+
+if ! seqkit stats "$INPUT" &>/dev/null; then
+    echo "Error: Input file '$INPUT' is not a valid FASTA file."
+    exit 1
+fi
+
+BASENAME=$(basename "$INPUT" .fasta)
+BASENAME=$(basename "$BASENAME" .bnk)
+OUTDIR="tribes"
+REPORT="${BASENAME}_tribes_report.txt"
+
+# Thread allocation
+TOTAL_THREADS=$(nproc)
+AVAILABLE_THREADS=$((TOTAL_THREADS - 3))
+(( AVAILABLE_THREADS < 1 )) && AVAILABLE_THREADS=1
+
+PARALLEL_JOBS=$((AVAILABLE_THREADS / 2))
+(( PARALLEL_JOBS < 1 )) && PARALLEL_JOBS=1
+THREADS_PER_JOB=$((AVAILABLE_THREADS / PARALLEL_JOBS))
+(( THREADS_PER_JOB < 1 )) && THREADS_PER_JOB=1
+
+# Setup output dir
+rm -rf "$OUTDIR" 2>/dev/null
+mkdir -p "$OUTDIR"
+
+echo "Starting tribe analysis on $INPUT..."
+echo "Thread allocation: $PARALLEL_JOBS parallel jobs, $THREADS_PER_JOB threads each (keeping 3 cores free)"
+
+# Step 1: vsearch clustering
+echo "Running vsearch clustering (99% identity, min 5 sequences)..."
+UC_FILE="${OUTDIR}/clusters.uc"
+vsearch --cluster_fast "$INPUT" \
+    --id 0.99 \
+    --strand plus \
+    --uc "$UC_FILE" \
+    --quiet
+
+# Step 2: Extract clusters with .5 sequences
+awk '$1=="C" && $3>=5 {print $2}' "$UC_FILE" > "${OUTDIR}/valid_clusters.txt"
+
+TRIBE_COUNT=$(wc -l < "${OUTDIR}/valid_clusters.txt")
+if [ "$TRIBE_COUNT" -eq 0 ]; then
+    echo "No tribes found meeting criteria (.5 sequences at 99% identity)."
+    echo "No tribes found" > "$REPORT"
+    rm -rf "$OUTDIR"
+    exit 0
+fi
+
+echo "Found $TRIBE_COUNT tribes. Extracting sequences..."
+
+TRIBE_NUM=0
+VALID_TRIBES=()
+
+while read -r CLUSTER_ID; do
+    TRIBE_FILE="${OUTDIR}/tribe_${TRIBE_NUM}"
+
+    # Extract sequences
+    awk -v cluster="$CLUSTER_ID" '
+        $1=="H" && $2==cluster {print $9}
+        $1=="S" && $2==cluster {print $9}
+    ' "$UC_FILE" | seqkit grep -f - "$INPUT" > "$TRIBE_FILE" 2>"${TRIBE_FILE}.extract.log"
+
+    if [ -s "$TRIBE_FILE" ] && seqkit stats "$TRIBE_FILE" &>/dev/null; then
+        VALID_TRIBES+=("$TRIBE_FILE")
+    else
+        rm -f "$TRIBE_FILE" "${TRIBE_FILE}.extract.log"
+    fi
+
+    ((TRIBE_NUM++))
+done < "${OUTDIR}/valid_clusters.txt"
+
+rm -f "$UC_FILE" "${OUTDIR}/valid_clusters.txt"
+
+if [ ${#VALID_TRIBES[@]} -eq 0 ]; then
+    echo "No valid tribe files generated."
+    echo "No tribes found" > "$REPORT"
+    rm -rf "$OUTDIR"
+    exit 0
+fi
+
+echo "Successfully extracted ${#VALID_TRIBES[@]} valid tribes."
+
+# Step 3: Prepare tribe list + subsample large tribes
+TRIBE_LIST="${OUTDIR}/tribe_list.txt"
+> "$TRIBE_LIST"
+
+for TRIBE_FILE in "${VALID_TRIBES[@]}"; do
+    NSEQ=$(grep -c "^>" "$TRIBE_FILE" 2>/dev/null || echo 0)
+    [ "$NSEQ" -eq 0 ] && continue
+
+    if [ "$NSEQ" -gt 100 ]; then
+        SUBSAMPLE="${TRIBE_FILE}.subsample.fasta"
+        seqkit sample -n 100 "$TRIBE_FILE" > "$SUBSAMPLE" 2>/dev/null
+        [ -s "$SUBSAMPLE" ] && echo "$TRIBE_FILE|$SUBSAMPLE|$NSEQ" >> "$TRIBE_LIST"
+    else
+        echo "$TRIBE_FILE|$TRIBE_FILE|$NSEQ" >> "$TRIBE_LIST"
+    fi
+done
+
+[ ! -s "$TRIBE_LIST" ] && {
+    echo "No tribes to process after filtering."
+    echo "No tribes found" > "$REPORT"
+    rm -rf "$OUTDIR"
+    exit 0
+}
+
+# Step 4: Process tribes
+STATS_FILE="${OUTDIR}/tribe_stats.txt"
+> "$STATS_FILE"
+
+COMPLETED=0
+TOTAL=$(wc -l < "$TRIBE_LIST")
+
+while IFS='|' read -r TRIBE_FILE ALIGN_FILE NSEQ; do
+    ((COMPLETED++))
+    echo "Processing tribe $COMPLETED/$TOTAL..."
+
+    # Validate inputs
+    [[ ! -f "$TRIBE_FILE" ]] && { echo "  Skipping: tribe file missing"; continue; }
+    [[ ! -s "$TRIBE_FILE" ]] && { echo "  Skipping: tribe file empty"; continue; }
+
+    [[ ! -f "$ALIGN_FILE" ]] && { echo "  Skipping: align file missing"; continue; }
+    [[ ! -s "$ALIGN_FILE" ]] && { echo "  Skipping: align file empty"; continue; }
+
+    # Get sequence lengths from original tribe
+    LENGTHS=$(seqkit fx2tab -l -n "$TRIBE_FILE" 2>/dev/null | awk '{print $2}')
+    [[ -z "$LENGTHS" ]] && { echo "  Skipping: could not extract lengths"; continue; }
+
+    AVG_LEN=$(echo "$LENGTHS" | awk '{sum+=$1} END {printf "%.0f", sum/NR}')
+    MIN_LEN=$(echo "$LENGTHS" | sort -n | head -1)
+    MAX_LEN=$(echo "$LENGTHS" | sort -n | tail -1)
+
+    # Align
+    echo "  Aligning..."
+    mafft --thread "$THREADS_PER_JOB" --localpair --maxiterate 1000 --ep 0.123 --nuc --reorder \
+        --preservecase --quiet "$ALIGN_FILE" > "${ALIGN_FILE}.al" 2>"${TRIBE_FILE}.mafft.log"
+
+    [[ ! -s "${ALIGN_FILE}.al" ]] && { echo "  Skipping: alignment failed"; continue; }
+
+    # Generate consensus . convert to single-line first (CRITICAL FIX)
+    echo "  Generating consensus..."
+    NSEQ_ALIGN=$(grep -c "^>" "$ALIGN_FILE" 2>/dev/null || echo 0)
+    [[ "$NSEQ_ALIGN" -eq 0 ]] && { echo "  Skipping: no sequences in alignment"; continue; }
+
+    PLUR=$((NSEQ_ALIGN * 35 / 100))
+
+    # Convert alignment to single-line FASTA (cons requires this)
+    seqkit seq -w 0 "${ALIGN_FILE}.al" > "${ALIGN_FILE}.al.single"
+# Run cons and fix header in one step
+cons -plurality "$PLUR" -filter < "${ALIGN_FILE}.al.single" 2>"${TRIBE_FILE}.cons.log" | \
+    awk '/^>/ {print ">consensus"; next} {gsub(/[Nn]/, "-"); print}' | \
+    seqkit seq -w 0 > "${TRIBE_FILE}.cons"
+
+    # Clean up temp file
+    rm -f "${ALIGN_FILE}.al.single"
+
+    # Validate consensus length
+    CONS_LEN=$(seqkit fx2tab -l -n "${TRIBE_FILE}.cons" 2>/dev/null | awk '{print $2}')
+    [[ -z "$CONS_LEN" ]] && { echo "  Skipping: could not extract consensus length"; continue; }
+    if [ "$CONS_LEN" -lt 50 ]; then
+        echo "  Warning: Consensus too short ($CONS_LEN bp) . possible alignment parsing error"
+        continue
+    fi
+
+    # Generate BED file for this tribe . robust version
+    echo "  Generating BED file..."
+    if ! awk '
+        BEGIN { valid=0 }
+        /^>/ {
+            header = substr($0, 2)
+            gsub(/ /, "_", header)
+            if (match(header, /^([^:]+):([0-9]+)-([0-9]+)(\((.)\))?/, parts)) {
+                chr = parts[1]
+                start = parts[2] - 1
+                end = parts[3]
+                strand = (parts[5] == "" ? "." : parts[5])
+                print chr "\t" start "\t" end "\t" header "\t1000\t" strand
+                valid++
+            } else {
+                print "ERROR: Invalid header format: " header > "/dev/stderr"
+            }
+        }
+        END {
+            if (valid == 0) exit 1
+        }
+    ' "$TRIBE_FILE" > "${TRIBE_FILE}.bed.tmp"; then
+        echo "  Skipping: BED generation failed (no valid headers)"
+        continue
+    fi
+
+    mv "${TRIBE_FILE}.bed.tmp" "${TRIBE_FILE}.bed"
+
+    # Sort BED
+    if ! sort -k1,1 -k2,2n "${TRIBE_FILE}.bed" > "${TRIBE_FILE}.bed.sorted"; then
+        echo "  Skipping: BED sorting failed"
+        continue
+    fi
+    mv "${TRIBE_FILE}.bed.sorted" "${TRIBE_FILE}.bed"
+
+    # Add track header
+    if ! sed -i '1i track name="'$NSEQ'-tribe'$TRIBE_NUM'"' "${TRIBE_FILE}.bed"; then
+        echo "  Warning: Failed to add track header to BED"
+    fi
+
+    echo "$NSEQ|$CONS_LEN|$AVG_LEN|$MIN_LEN|$MAX_LEN|$TRIBE_FILE" >> "$STATS_FILE"
+done < "$TRIBE_LIST"
+
+echo "All tribes processed."
+echo ""
+
+# Step 5: Sort by size, rename, and fix headers
+if [ ! -s "$STATS_FILE" ]; then
+    echo "No tribes were successfully processed."
+    echo "No tribes successfully processed" > "$REPORT"
+    exit 0
+fi
+
+mapfile -t TRIBE_STATS < "$STATS_FILE"
+TRIBES_FOUND=${#TRIBE_STATS[@]}
+
+echo "Renaming tribes by size..."
+IFS=$'\n' SORTED_STATS=($(printf '%s\n' "${TRIBE_STATS[@]}" | sort -t'|' -k1 -nr))
+
+RANK=1
+FINAL_STATS=()
+
+for STAT in "${SORTED_STATS[@]}"; do
+    IFS='|' read -r NSEQ CONS_LEN AVG_LEN MIN_LEN MAX_LEN OLD_FILE <<< "$STAT"
+
+    # Verify files exist
+    [[ ! -f "$OLD_FILE" ]] && continue
+    [[ ! -f "${OLD_FILE}.cons" ]] && continue
+    [[ ! -f "${OLD_FILE}.bed" ]] && continue
+
+    NEW_PREFIX="${NSEQ}-tribe${RANK}-${CONS_LEN}"
+    NEW_FASTA="${OUTDIR}/${NEW_PREFIX}.fasta"
+    NEW_CONS="${OUTDIR}/${NEW_PREFIX}_consensus.fasta"
+    NEW_BED="${OUTDIR}/${NEW_PREFIX}.bed"
+
+    # Rename tribe fasta
+    mv "$OLD_FILE" "$NEW_FASTA" 2>/dev/null || {
+        echo "Warning: Failed to rename $OLD_FILE"
+        continue
+    }
+
+    # Rename consensus AND update header to match new name
+    {
+        echo ">${NEW_PREFIX}"
+        tail -n +2 "${OLD_FILE}.cons"
+    } > "$NEW_CONS"
+    rm -f "${OLD_FILE}.cons"
+
+    # Rename BED
+    mv "${OLD_FILE}.bed" "$NEW_BED" 2>/dev/null
+
+    # Rename alignment if exists
+    if [ -f "${OLD_FILE}.subsample.fasta.al" ]; then
+        mv "${OLD_FILE}.subsample.fasta.al" "${OUTDIR}/${NEW_PREFIX}.subsample.al" 2>/dev/null
+        rm -f "${OLD_FILE}.subsample.fasta"
+    elif [ -f "${OLD_FILE}.al" ]; then
+        mv "${OLD_FILE}.al" "${OUTDIR}/${NEW_PREFIX}.al" 2>/dev/null
+    fi
+
+    FINAL_STATS+=("$RANK\t$NSEQ\t$CONS_LEN\t$AVG_LEN\t$MIN_LEN\t$MAX_LEN")
+    ((RANK++))
+done
+
+rm -f "$TRIBE_LIST" "$STATS_FILE"
+
+# Step 6: Generate report
+TRIBES_PROCESSED=${#FINAL_STATS[@]}
+
+{
+    echo "=========================================="
+    echo "TRIBE ANALYSIS REPORT"
+    echo "Input file: $INPUT"
+    echo "Date: $(date)"
+    echo "=========================================="
+    echo ""
+    echo "SUMMARY STATISTICS"
+    echo "----------------------------------------"
+    echo "Total tribes found: $TRIBES_FOUND"
+    echo "Tribes successfully processed: $TRIBES_PROCESSED"
+    if [ $TRIBES_PROCESSED -lt $TRIBES_FOUND ]; then
+        SKIPPED=$((TRIBES_FOUND - TRIBES_PROCESSED))
+        echo "Tribes skipped (errors): $SKIPPED"
+    fi
+
+    # Calculate mean and median tribe sizes
+    SIZES=$(printf '%s\n' "${SORTED_STATS[@]}" | cut -d'|' -f1)
+    MEAN=$(echo "$SIZES" | awk '{sum+=$1} END {printf "%.1f", sum/NR}')
+    MEDIAN=$(echo "$SIZES" | sort -n | awk '{a[NR]=$1} END {if(NR%2==1) print a[(NR+1)/2]; else print (a[NR/2]+a[NR/2+1])/2}')
+
+    echo "Mean tribe size: $MEAN sequences"
+    echo "Median tribe size: $MEDIAN sequences"
+    echo ""
+    echo "PER-TRIBE DETAILS"
+    echo "----------------------------------------"
+    echo -e "Tribe#\tCount\tCons_len\tAvg_len\tMin_len\tMax_len"
+    printf '%s\n' "${FINAL_STATS[@]}"
+    echo ""
+    echo "=========================================="
+    echo "Analysis complete. Output in: $OUTDIR/"
+    echo "=========================================="
+} > "$REPORT"
+
+# Cleanup empty log files
+find "$OUTDIR" -name "*.log" -empty -delete 2>/dev/null
+
+echo ""
+echo "Done! Report saved to: $REPORT"
+echo "Tribe files saved to: $OUTDIR/"
